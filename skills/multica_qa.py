@@ -40,18 +40,33 @@ QA_SYSTEM_PROMPT = """你是软件交付质检员。基于 issue 的需求描述
 只输出符合给定 JSON Schema 的结论，不要输出解释。"""
 
 
-async def run_multica(*args: str) -> str:
-    """执行 multica CLI 子命令并返回 stdout（Windows 下避免中文编码问题的统一入口）。"""
-    proc = await asyncio.create_subprocess_exec(
-        settings.multica_bin,
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"multica CLI 执行失败: {stderr.decode('utf-8', 'replace')[:300]}")
-    return stdout.decode("utf-8", "replace")
+# 瞬态错误：daemon 并发压力/限流导致的假性失败（技能文档：重试即可，勿改 workspace_id/profile）
+TRANSIENT_CLI_ERRORS = ("invalid workspace_id", "Request timed out")
+
+
+async def run_multica(*args: str, retries: int = 1) -> str:
+    """执行 multica CLI 子命令并返回 stdout（Windows 下避免中文编码问题的统一入口）。
+
+    编码走 Python list-args（CreateProcessW UTF-16），是技能文档认证的唯一可靠姿势。
+    瞬态错误（daemon 压力/超时）自动重试一次；其余非零退出立即抛出。
+    """
+    last_error = ""
+    for attempt in range(retries + 1):
+        proc = await asyncio.create_subprocess_exec(
+            settings.multica_bin,
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            return stdout.decode("utf-8", "replace")
+        last_error = stderr.decode("utf-8", "replace")[:300]
+        if attempt < retries and any(t in last_error for t in TRANSIENT_CLI_ERRORS):
+            await asyncio.sleep(2)
+            continue
+        raise RuntimeError(f"multica CLI 执行失败: {last_error}")
+    raise RuntimeError(f"multica CLI 执行失败: {last_error}")
 
 
 async def fetch_issue(issue_id: str) -> dict[str, str]:
@@ -61,14 +76,24 @@ async def fetch_issue(issue_id: str) -> dict[str, str]:
 
 
 async def fetch_comments(issue_id: str) -> list[str]:
-    """拉取最近 10 条讨论/交付评论的内容（防御式解析：兼容 list 或 dict 包裹）。"""
+    """拉取最近 10 条讨论/交付评论的内容（防御式解析：兼容 list 或 dict 包裹）。
+
+    `type=system` 的评论携带平台级诊断信息（如 429 用量限制、402 余额），
+    加 [system] 前缀保留给评审者——这类信息常是"任务卡住"的唯一线索。
+    """
     raw = await run_multica(
         "issue", "comment", "list", issue_id,
         "--output", "json", "--compact", "--recent", "10",
     )
     data = json.loads(raw)
     items = data if isinstance(data, list) else data.get("comments", [])
-    return [str(c.get("content", "")) for c in items if isinstance(c, dict) and c.get("content")]
+    results = []
+    for c in items:
+        if not isinstance(c, dict) or not c.get("content"):
+            continue
+        prefix = "[system] " if c.get("type") == "system" else ""
+        results.append(prefix + str(c["content"]))
+    return results
 
 
 @register_skill

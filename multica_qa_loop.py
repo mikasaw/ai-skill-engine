@@ -155,6 +155,18 @@ async def watch_phase(issue_id: str, poll_seconds: float = 20.0, timeout_seconds
         run = await latest_run(issue_id)
         status = str((run or {}).get("status", "unknown"))
         if status in TERMINAL_RUN_STATUSES:
+            if status == "failed":
+                # runtime_recovery：daemon 可能自动派生更新的姊妹任务重试
+                # （技能文档 v3.20.1：failed + 新任务 running = 正常恢复链路，不算失败）
+                await asyncio.sleep(poll_seconds)
+                newer = await latest_run(issue_id)
+                newer_created = str((newer or {}).get("created_at", ""))
+                if newer and newer_created > str((run or {}).get("created_at", "")):
+                    run, status = newer, str(newer.get("status", "unknown"))
+                    if status not in TERMINAL_RUN_STATUSES:
+                        waited += poll_seconds
+                        print(f"[watch] {issue_id} 检测到恢复任务（runtime_recovery），继续等待...", flush=True)
+                        continue
             summary = {
                 "issue": issue_id,
                 "run_status": status,

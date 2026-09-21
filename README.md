@@ -148,6 +148,36 @@ python multica_qa_loop.py submit MIT-551
 python multica_qa_loop.py auto <issue-id>...
 ```
 
+### Multica 实操经验备忘（源自 hermes 三技能 + 本项目实测）
+
+**编码与调用**
+- CLI 调用一律走 Python `subprocess` list-args（`CreateProcessW` UTF-16）——PowerShell argv 的
+  GBK 双重编码会把乱码写进数据库且不可逆；本项目 `run_multica` 即此姿势。
+- `--output json` 必须显式传（默认 table）；`issue get` 默认 JSON。
+- `issue comment add` 用位置参数 `<issue-id>`（无 `--issue-id`）；`agent get` 只认 UUID 不认名字；
+  `squad member add <squad-id> --member-id <uuid>`；`issue view` 不存在，统一 `issue get`。
+- 长文本优先 `--description-stdin` / `--content-file`；本项目统一走 cwd 内临时文件 + `newline="\n"`。
+
+**任务语义**
+- `issue rerun` = 取消当前 + 重新入队；assign 后不要再 rerun。
+- 已取消的 issue 可能被完成中的 agent 推回 in_review——取消后复查最终状态。
+- `issue create --assignee` 有并发空位会立即拾取、无视 stage：依赖前置的子单创建时不给 assignee。
+- comment 必须先于 `issue status done`（证据顺序）；`--no-start` 防止状态变更唤醒 agent。
+- `type=system` 评论携带 429 用量 / 402 余额等平台错误原文，是"任务卡住"的第一诊断位。
+
+**agent 管理**
+- `agent update --instructions` 是**整表替换**：先 GET 全量、追加后写回；单次 ≤1800 字符；
+  严禁用短串试探（会把默认 prompt 擦没且不可恢复）；更新后立即回读核对长度。
+- 新建 agent 的 instructions 必须冻结**项目绝对路径**（daemon 的 task workdir 是空目录，
+  agent 行为由 instructions/CLAUDE.md 的主路径决定——MIT-553 零交付的根因）。
+- agent 的 feat branch 不自动 merge main：验收查提交要 `git log --branches --all`。
+
+**诊断顺序**（任务不动时）
+1. `issue runs <id>` 看最新 run 状态（`failed+runtime_recovery` 后紧跟新任务 = 自动恢复，非失败）；
+2. `issue comment list <id>` 找 `[system]` 错误评论；
+3. `invalid workspace_id`（rc=5）≠ 配置错误，是 daemon 并发压力——等 30-60s 重试即可；
+4. `issue list` 空输出先查 session 过期（exit 3 → `multica login`），再怀疑 API。
+
 ### Multica 机制备忘：追加评论 = resume 会话
 
 Multica 没有 session resume（`issue rerun` 自述为 fresh task；agent 的 `--custom-args`
