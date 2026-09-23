@@ -113,8 +113,13 @@ async def submit_phase(issue_id: str, override_path: str | None = None, close_on
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled", "canceled"}
 
 
-async def dispatch_phase(agent: str, plan_file: str, title: str | None = None) -> dict[str, Any]:
-    """读方案文件 → 建 issue 并指派 agent（指派即自动开工）→ 返回 issue 标识。"""
+async def dispatch_phase(
+    agent: str, plan_file: str, title: str | None = None, project: str | None = None
+) -> dict[str, Any]:
+    """读方案文件 → 建 issue 并指派 agent（指派即自动开工）→ 返回 issue 标识。
+
+    project: 可选 Project ID，传入则 issue 归入该项目（向后兼容：缺省不传该字段）。
+    """
     plan_text = Path(plan_file).read_text(encoding="utf-8")
     if not title:
         first_line = next((ln.strip() for ln in plan_text.splitlines() if ln.strip()), "")
@@ -124,10 +129,13 @@ async def dispatch_phase(agent: str, plan_file: str, title: str | None = None) -
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
             file.write(plan_text)
-        raw = await run_multica(
+        create_args = [
             "issue", "create", "--title", title, "--description-file", tmp,
             "--assignee", agent, "--output", "json",
-        )
+        ]
+        if project:
+            create_args += ["--project", project]
+        raw = await run_multica(*create_args)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -360,7 +368,7 @@ async def main_async(args: argparse.Namespace) -> None:
             result = await submit_phase(issue_id, override_path=args.verdict, close_on_pass=not args.no_close)
             print(f"[submit] {result}")
     elif args.command == "dispatch":
-        result = await dispatch_phase(args.agent, args.plan_file, title=args.title)
+        result = await dispatch_phase(args.agent, args.plan_file, title=args.title, project=args.project)
         print(f"[dispatch] {result}")
         print(f"下一步：后台运行 `python multica_qa_loop.py watch {result['issue']}`，完成后会唤醒会话进入验收。")
     elif args.command == "decide":
@@ -395,6 +403,7 @@ def main() -> None:
     dispatch_parser.add_argument("agent", help="承接开发的 agent 名（fuzzy match）")
     dispatch_parser.add_argument("plan_file", help="需求方案 Markdown 文件路径")
     dispatch_parser.add_argument("--title", default=None, help="issue 标题（默认取方案首个非空行）")
+    dispatch_parser.add_argument("--project", default=None, help="Project ID（可选，issue 归入该项目）")
 
     watch_parser = sub.add_parser("watch", help="开发等待：轮询最新 run 直至终止态（后台运行，退出唤醒会话）")
     watch_parser.add_argument("issue_ids", nargs="+", help="Multica issue 的 ID/identifier")

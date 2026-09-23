@@ -23,10 +23,13 @@ class Settings:
     # notify 中间件默认 webhook 地址
     notify_webhook_url: str = os.getenv("SKILL_ENGINE_WEBHOOK_URL", "")
 
-    # multica CLI 可执行文件路径
+    # multica CLI 可执行文件路径：默认按 Windows 标准变量展开（不含用户名）；
+    # 非 Windows 或自定义安装时务必设置 MULTICA_BIN 环境变量覆盖
     multica_bin: str = os.getenv(
         "MULTICA_BIN",
-        r"C:\Users\www\AppData\Local\Programs\@multicadesktop\resources\app.asar.unpacked\resources\bin\multica.exe",
+        os.path.expandvars(
+            r"%LOCALAPPDATA%\Programs\@multicadesktop\resources\app.asar.unpacked\resources\bin\multica.exe"
+        ),
     )
 
     # 挂到所有技能外层的全局中间件（在技能级中间件的外层执行）

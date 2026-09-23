@@ -1,5 +1,7 @@
 # AI 工作循环技能引擎 (AI Skill Engine)
 
+中文 | [English](#english)
+
 基于 **洋葱模型（中间件模式）** + **注册表模式** 的 AI 工程化底座：核心引擎极简，
 合约校验、防御（超时/熔断）、监控等一切扩展能力均通过中间件插件化注入。
 
@@ -249,3 +251,56 @@ python multica_qa_loop.py comment <issue-id> --file 本轮判据.md
   应移入对应 Middleware；
 - 新增切面能力时修改了 `core/` → 应改为新增 Middleware；
 - 所有跨组件数据传递只经 `SkillContext`（`metadata` / `errors`）。
+
+## 致谢
+
+- [Multica](https://github.com/multica-ai/multica) — AI 原生团队工作区，`multica_qa_loop.py`
+  派遣/验收流水线的执行底座。
+
+## English
+
+An AI engineering foundation built on the **onion model (middleware pattern)** + **registry
+pattern**: a micro-kernel core where contracts (schema validation & self-healing), defensive
+mechanisms (circuit breaker / timeout / model fallback / cost limiting), observability
+(OpenTelemetry), and notifications are all pluggable middlewares — and business skills stay pure.
+
+### What's inside
+
+- `core/` — SkillContext, BaseSkill + registry, MiddlewareChain, SkillRunner;
+- `middlewares/` — tracing / circuit-breaker / contract (schema validation with self-healing
+  retries) / model fallback / cost limiter / notify;
+- `skills/` — example skills, including `multica_qa` (structured QA verdicts for Multica
+  agent deliveries);
+- `multica_qa_loop.py` — the dispatch → watch → fetch/submit acceptance pipeline over Multica
+  (comment-triggered resume, staged barriers, machine-checked decision table);
+- `webhook_receiver.py` — a stdlib-only HTTP receiver mapping webhook events to skill runs.
+
+### Quick start
+
+```bash
+python -m venv .venv
+.venv/Scripts/python -m pip install "pydantic[email]" opentelemetry-api opentelemetry-sdk pytest pytest-asyncio
+.venv/Scripts/python -m pytest          # 78 tests, fully offline
+.venv/Scripts/python main.py            # demo: normal / dirty-data self-heal / timeout / fallback
+```
+
+Real-LLM mode (optional): set `OPENAI_API_KEY` and `pip install instructor litellm`.
+
+### Extensibility
+
+- New middleware: add a file under `middlewares/`, subclass `BaseMiddleware`, register with
+  `@register_middleware` — never touch `core/` or `skills/`;
+- New skill: define Pydantic input/output schemas, subclass `BaseSkill`, implement `execute`
+  (business logic only — no retries, no logging), register with `@register_skill`.
+
+See the Chinese sections above for the full architecture guide, the Multica pipeline protocol,
+and the field-tested ops playbook.
+
+## Acknowledgments
+
+- [Multica](https://github.com/multica-ai/multica) — the AI-native team workspace that powers
+  the `multica_qa_loop.py` dispatch/acceptance pipeline.
+
+## License
+
+[MIT](LICENSE)
