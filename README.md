@@ -50,8 +50,16 @@ ai_skill_engine/
 ├── webhook_receiver.py # 极薄 webhook 接收器：HTTP 事件 → 技能执行（stdlib，零新依赖）
 ├── multica_qa_loop.py  # 质检闭环编排：本地质检 → 结论回写 Multica issue 评论
 ├── agents/ qa_reviews/ # 本地运行时目录（agent 配置导出 / 验收材料与 verdict），不入库
+├── skill/multica-squad-pipeline/  # 配套 ZCode 技能：派遣→验收流水线方法论（可整体拷入 ~/.agents/skills/ 启用）
 └── main.py             # 运行入口与四用例演示
 ```
+
+## 配套 ZCode 技能
+
+[`skill/multica-squad-pipeline/`](skill/multica-squad-pipeline/README.md) 是与工具链配套的
+ZCode 技能包：沉淀了「派遣 → watch → 半程接力验收 → 打回重做」的完整作业纪律（决策表、
+双层独立验证、变异自证、事故处置手册）。启用方式：把该目录整体拷贝（或 junction）到
+`~/.agents/skills/multica-squad-pipeline`，新会话即自动发现。
 
 ## 设计原则
 
@@ -296,6 +304,13 @@ Real-LLM mode (optional): set `OPENAI_API_KEY` and `pip install instructor litel
 
 See the Chinese sections above for the full architecture guide, the Multica pipeline protocol,
 and the field-tested ops playbook.
+
+### Companion ZCode skill
+
+[`skill/multica-squad-pipeline/`](skill/multica-squad-pipeline/README.md) ships the companion
+ZCode skill: the full operating discipline for the dispatch → watch → relay-acceptance loop
+(decision table, dual-layer verification, mutation evidence, incident playbook). To enable,
+copy (or junction) that directory to `~/.agents/skills/multica-squad-pipeline`.
 
 ## Acknowledgments
 
