@@ -49,6 +49,7 @@ ai_skill_engine/
 ├── config.py           # 全局配置（模型、降级链、webhook、multica CLI 路径）
 ├── webhook_receiver.py # 极薄 webhook 接收器：HTTP 事件 → 技能执行（stdlib，零新依赖）
 ├── multica_qa_loop.py  # 质检闭环编排：本地质检 → 结论回写 Multica issue 评论
+├── agents/ qa_reviews/ # 本地运行时目录（agent 配置导出 / 验收材料与 verdict），不入库
 └── main.py             # 运行入口与四用例演示
 ```
 
