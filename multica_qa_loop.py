@@ -382,6 +382,88 @@ async def agent_harden_phase(agent: str, addition_file: str, marker: str) -> dic
     return {"agent": agent, "skipped": False, "chars": f"{len(current)} -> {len(check)}", "marker": marker}
 
 
+# ---------- SOP 双源同步：仓库 skill_sop/ ↔ Multica 工作区技能 ----------
+
+SOP_SKILL_ID = "6e19e683-dcfc-4ba2-afd8-e1304dff891b"  # mdboard-pipeline-sop
+SOP_SOURCE_DIR = Path("skill_sop")
+
+
+def _sha256(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def _content_fingerprint(data: bytes) -> str:
+    """内容指纹：换行归一化后哈希——Windows checkout 的 CRLF 与上传的 LF 不得算漂移。"""
+    return _sha256(data.replace(b"\r\n", b"\n"))
+
+
+async def sop_sync_phase(apply: bool = False) -> dict[str, Any]:
+    """对比仓库 skill_sop/ 与工作区技能，列出漂移；apply=True 时以仓库为准 upsert。
+
+    事实源约定：仓库（skill_sop/）为单一事实源，工作区技能是它的投影——
+    改纪律先改仓库再 sop-sync --apply，方向永远单向。
+    """
+    if not SOP_SOURCE_DIR.exists():
+        raise ValueError(f"源目录 {SOP_SOURCE_DIR} 不存在（应在 ai_skill_engine 仓库根运行）")
+
+    remote_files_raw = await run_multica("skill", "get", SOP_SKILL_ID, "--with-content", "--output", "json")
+    remote_skill = json.loads(remote_files_raw)
+    remote_by_path = {
+        f["path"]: f for f in remote_skill.get("files", []) if isinstance(f, dict) and f.get("path")
+    }
+
+    drifts: list[dict[str, str]] = []
+    # 主文档：SKILL.md ↔ skill.content（指纹对比，换行风格差异不算漂移）
+    local_main = (SOP_SOURCE_DIR / "SKILL.md").read_bytes()
+    remote_main = (remote_skill.get("content") or "").encode("utf-8")
+    if _content_fingerprint(local_main) != _content_fingerprint(remote_main):
+        drifts.append({"path": "SKILL.md", "kind": "changed" if remote_main else "missing"})
+
+    # references/：--with-content 拉全文做归一化指纹对比（不依赖服务端 hash 算法）
+    local_refs = sorted((SOP_SOURCE_DIR / "references").glob("*.md")) if (SOP_SOURCE_DIR / "references").exists() else []
+    for ref in local_refs:
+        rel = f"references/{ref.name}"
+        remote_file = remote_by_path.get(rel)
+        if remote_file is None:
+            drifts.append({"path": rel, "kind": "missing"})
+            continue
+        remote_content = (remote_file.get("content") or "").encode("utf-8")
+        if _content_fingerprint(ref.read_bytes()) != _content_fingerprint(remote_content):
+            drifts.append({"path": rel, "kind": "changed"})
+    for rel in remote_by_path:  # 远端多余文件（本地已删）只报告，不自动删
+        if rel.startswith("references/") and not (SOP_SOURCE_DIR / rel).exists():
+            drifts.append({"path": rel, "kind": "extra-remote"})
+
+    if apply and drifts:
+        for drift in drifts:
+            if drift["kind"] == "extra-remote":
+                continue  # 删除远端文件属破坏性操作，保持人工
+            if drift["path"] == "SKILL.md":
+                fd, tmp = tempfile.mkstemp(suffix=".md", dir=os.getcwd())
+                try:
+                    with os.fdopen(fd, "wb") as file:
+                        file.write(local_main)
+                    await run_multica(
+                        "skill", "update", SOP_SKILL_ID, "--content-file", tmp, "--output", "json"
+                    )
+                finally:
+                    os.unlink(tmp)
+            else:
+                await run_multica(
+                    "skill", "files", "upsert", SOP_SKILL_ID,
+                    "--path", drift["path"],
+                    "--content-file", str(SOP_SOURCE_DIR / drift["path"]),
+                    "--output", "json",
+                )
+        # apply 后复核
+        recheck = await sop_sync_phase(apply=False)
+        return {"applied": len(drifts), "remaining": recheck["drifts"]}
+
+    return {"skill": SOP_SKILL_ID, "drifts": drifts, "in_sync": not drifts}
+
+
 async def comment_phase(issue_id: str, content: str, parent: str | None = None) -> None:
     """追评入口：把本轮判据写进评论并触发 agent（Rule B：正文必须自带本轮判据）。"""
     fd, path = tempfile.mkstemp(suffix=".md", prefix="qa_comment_", dir=os.getcwd())
@@ -495,6 +577,8 @@ async def main_async(args: argparse.Namespace) -> None:
         print(f"[comment] 已追评到 {args.issue_id}（将触发 agent 唤醒）")
     elif args.command == "agent-harden":
         print(await agent_harden_phase(args.agent, args.addition_file, marker=args.marker))
+    elif args.command == "sop-sync":
+        print(await sop_sync_phase(apply=args.apply))
     elif args.command == "watch":
         for issue_id in args.issue_ids:
             print(await watch_phase(
@@ -559,6 +643,8 @@ def main() -> None:
     harden_parser.add_argument("agent", help="agent 名字或 id")
     harden_parser.add_argument("addition_file", help="追加段文件（UTF-8，须含 marker）")
     harden_parser.add_argument("--marker", required=True, help="幂等标记（追加段中的唯一串，重复追加时据此跳过）")
+    sop_parser = sub.add_parser("sop-sync", help="SOP 双源同步：diff 仓库 skill_sop/ 与工作区技能，--apply 以仓库为准推送")
+    sop_parser.add_argument("--apply", action="store_true", help="把仓库内容 upsert 到工作区技能（单向，仓库为事实源）")
     auto_parser = sub.add_parser("auto", help="引擎全自动验收：抓取 → LLM 评审 → 回写 → 关单（需 LLM key，适合批量）")
     auto_parser.add_argument("issue_ids", nargs="+", help="Multica issue 的 ID/identifier")
 
