@@ -21,6 +21,7 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,47 @@ def load_verdict(issue_id: str, override_path: str | None = None) -> QaVerdict:
     return QaVerdict.model_validate(data)  # 不合法将抛 ValidationError
 
 
+# ---------- 成本账本：流水线各环节的本地记账（issue usage 服务端聚合延迟大，先自建数据） ----------
+
+LEDGER_PATH = REVIEW_DIR / "ledger.jsonl"
+
+
+def append_ledger(event: str, issue: str, **fields: Any) -> dict[str, Any]:
+    """追加一条 JSONL 记账：event/issue/ts 固定，其余按环节自定义（时长/分数等）。"""
+    record = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"), "event": event, "issue": issue, **fields}
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LEDGER_PATH.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return record
+
+
+def ledger_summary() -> dict[str, Any]:
+    """按 event 汇总账本：次数、累计 watch 时长（秒）与打回率。"""
+    counts: dict[str, int] = {}
+    watch_seconds = 0.0
+    submits = rejects = 0
+    if not LEDGER_PATH.exists():
+        return {"events": counts, "watch_seconds": 0, "reject_rate": None}
+    for line in LEDGER_PATH.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event = record.get("event", "?")
+        counts[event] = counts.get(event, 0) + 1
+        if event == "watch" and isinstance(record.get("waited_seconds"), (int, float)):
+            watch_seconds += record["waited_seconds"]
+        if event == "submit":
+            submits += 1
+            if record.get("passed") is False:
+                rejects += 1
+    return {
+        "events": counts,
+        "watch_seconds": round(watch_seconds),
+        "reject_rate": round(rejects / submits, 3) if submits else None,
+    }
+
+
 async def submit_phase(issue_id: str, override_path: str | None = None, close_on_pass: bool = True) -> dict[str, Any]:
     verdict = load_verdict(issue_id, override_path)
     comment = build_pass_comment(verdict) if verdict.passed else build_reject_comment(verdict)
@@ -156,8 +198,30 @@ async def latest_run(issue_id: str) -> dict[str, Any] | None:
     return sorted(items, key=lambda r: str(r.get("created_at", "")), reverse=True)[0]
 
 
-async def watch_phase(issue_id: str, poll_seconds: float = 20.0, timeout_seconds: float = 1800.0) -> dict[str, Any]:
-    """轮询最新 run 直至终止态；设计为后台运行，退出即唤醒会话进入验收。"""
+async def watch_phase(
+    issue_id: str,
+    poll_seconds: float = 20.0,
+    timeout_seconds: float = 1800.0,
+    expect_agent: str | None = None,
+    loop_on_timeout: bool = False,
+) -> dict[str, Any]:
+    """轮询最新 run 直至终止态；设计为后台运行，退出即唤醒会话进入验收。
+
+    expect_agent：指派方预期的 agent 名/id，不符立即报错退出——防盯错单
+    （真实事故：watch 参数笔误盯了并行流水线的单，验收了别人的完成状态）。
+    loop_on_timeout：超时不退出，重置计时继续等（免人工重挂）。
+    """
+    if expect_agent:
+        issue = json.loads(await run_multica("issue", "get", issue_id, "--output", "json"))
+        actual = issue.get("assignee_id") or ""
+        asg = issue.get("assignee")
+        actual_name = asg.get("name", "") if isinstance(asg, dict) else ""
+        if expect_agent not in (actual, actual_name):
+            raise RuntimeError(
+                f"[watch] 指派校验失败：{issue_id} 的 assignee 是 '{actual_name or actual}'，"
+                f"与预期 '{expect_agent}' 不符——可能盯错了单，拒绝轮询"
+            )
+    started = datetime.now(timezone.utc)
     waited = 0.0
     while True:
         run = await latest_run(issue_id)
@@ -185,9 +249,15 @@ async def watch_phase(issue_id: str, poll_seconds: float = 20.0, timeout_seconds
                 print(f"[watch] run 已完成，进入验收：python multica_qa_loop.py fetch {issue_id}")
             else:
                 print(f"[watch] run 异常终止：{summary}")
+            append_ledger("watch", issue_id, run_status=status, waited_seconds=round(waited))
             return summary
         if waited >= timeout_seconds:
+            if loop_on_timeout:
+                print(f"[watch] 等待超时（{timeout_seconds:.0f}s），--loop 模式重置计时继续等待...", flush=True)
+                waited = 0.0
+                continue
             print(f"[watch] 等待超时（{timeout_seconds:.0f}s），最新状态={status}；可重新运行 watch 继续等待。")
+            append_ledger("watch", issue_id, run_status=status, timed_out=True)
             return {"issue": issue_id, "run_status": status, "timed_out": True}
         await asyncio.sleep(poll_seconds)
         waited += poll_seconds
@@ -274,6 +344,44 @@ async def decide_phase(
     }
 
 
+async def agent_harden_phase(agent: str, addition_file: str, marker: str) -> dict[str, Any]:
+    """把追加段固化进 agent instructions——一键化整表替换纪律（高危操作防呆）。
+
+    纪律（技能文档实测）：agent update --instructions 是整表替换；单次 ≤1800 字符；
+    严禁短串试探（会擦掉默认 prompt 且不可恢复）。本命令内置全部断言：
+    GET 全量 → 幂等检查（marker 已在则拒绝重复追加）→ 长度安全线 → 写回 → 回读核对。
+    """
+    addition = Path(addition_file).read_text(encoding="utf-8")
+    if not addition.strip():
+        raise ValueError("追加段为空文件，拒绝执行（空串会擦掉全部 instructions）")
+
+    agents = json.loads(await run_multica("agent", "list", "--output", "json"))
+    match = next((a for a in agents if a.get("name") == agent or a.get("id") == agent), None)
+    if not match:
+        raise ValueError(f"agent '{agent}' 不存在")
+    agent_id = match["id"]
+
+    current_raw = await run_multica("agent", "get", agent_id, "--output", "json")
+    current = json.loads(current_raw).get("instructions") or ""
+    if marker in current:
+        return {"agent": agent, "skipped": True, "reason": f"marker '{marker}' 已存在，幂等跳过"}
+    if not current:
+        raise ValueError(f"{agent} 当前 instructions 为空——拒绝在空基线上追加（疑似已发生擦写事故）")
+
+    new_text = current + ("\n" if not current.endswith("\n") else "") + addition
+    if len(new_text) > 1800:
+        raise ValueError(f"合并后 {len(new_text)} 字符超安全线 1800——拆分追加段或精简现有内容")
+
+    await run_multica("agent", "update", agent_id, "--instructions", new_text, "--output", "json")
+    check = json.loads(await run_multica("agent", "get", agent_id, "--output", "json")).get("instructions") or ""
+    if len(check) != len(new_text) or marker not in check or current[:50] not in check:
+        raise RuntimeError(
+            f"回读核对失败：期望 {len(new_text)} 字符，实际 {len(check)}——instructions 可能被截断，"
+            f"立即人工检查 agent get {agent_id}"
+        )
+    return {"agent": agent, "skipped": False, "chars": f"{len(current)} -> {len(check)}", "marker": marker}
+
+
 async def comment_phase(issue_id: str, content: str, parent: str | None = None) -> None:
     """追评入口：把本轮判据写进评论并触发 agent（Rule B：正文必须自带本轮判据）。"""
     fd, path = tempfile.mkstemp(suffix=".md", prefix="qa_comment_", dir=os.getcwd())
@@ -357,6 +465,7 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.command == "fetch":
         for issue_id in args.issue_ids:
             path = await fetch_phase(issue_id)
+            append_ledger("fetch", issue_id)
             print(f"[fetch] {issue_id} 材料已写入: {path}")
         print(
             "下一步：评审者（ZCode 会话）阅读上述材料，"
@@ -366,9 +475,11 @@ async def main_async(args: argparse.Namespace) -> None:
     elif args.command == "submit":
         for issue_id in args.issue_ids:
             result = await submit_phase(issue_id, override_path=args.verdict, close_on_pass=not args.no_close)
+            append_ledger("submit", issue_id, passed=result["passed"], score=result["score"], closed=result["closed"])
             print(f"[submit] {result}")
     elif args.command == "dispatch":
         result = await dispatch_phase(args.agent, args.plan_file, title=args.title, project=args.project)
+        append_ledger("dispatch", result["issue"], identifier=result.get("identifier"), assignee=result.get("assignee"))
         print(f"[dispatch] {result}")
         print(f"下一步：后台运行 `python multica_qa_loop.py watch {result['issue']}`，完成后会唤醒会话进入验收。")
     elif args.command == "decide":
@@ -382,9 +493,17 @@ async def main_async(args: argparse.Namespace) -> None:
         content = Path(args.file).read_text(encoding="utf-8") if args.file else args.text
         await comment_phase(args.issue_id, content, parent=args.parent)
         print(f"[comment] 已追评到 {args.issue_id}（将触发 agent 唤醒）")
+    elif args.command == "agent-harden":
+        print(await agent_harden_phase(args.agent, args.addition_file, marker=args.marker))
     elif args.command == "watch":
         for issue_id in args.issue_ids:
-            print(await watch_phase(issue_id, poll_seconds=args.poll, timeout_seconds=args.timeout))
+            print(await watch_phase(
+                issue_id, poll_seconds=args.poll, timeout_seconds=args.timeout,
+                expect_agent=getattr(args, "expect_agent", None),
+                loop_on_timeout=getattr(args, "loop", False),
+            ))
+    elif args.command == "ledger":
+        print(json.dumps(ledger_summary(), ensure_ascii=False, indent=2))
     else:  # auto
         for issue_id in args.issue_ids:
             print(await run_qa_and_writeback(issue_id))
@@ -409,6 +528,8 @@ def main() -> None:
     watch_parser.add_argument("issue_ids", nargs="+", help="Multica issue 的 ID/identifier")
     watch_parser.add_argument("--poll", type=float, default=20.0, help="轮询间隔秒数（默认 20）")
     watch_parser.add_argument("--timeout", type=float, default=1800.0, help="最长等待秒数（默认 1800）")
+    watch_parser.add_argument("--expect-agent", default=None, help="预期 assignee（名字或 id），不符立即报错——防盯错单")
+    watch_parser.add_argument("--loop", action="store_true", help="超时不退出，重置计时继续等待")
 
     decide_parser = sub.add_parser("decide", help="派遣决策：机验规则表 A/C/E，输出追评或新建建议")
     decide_parser.add_argument("--worktree", default=None, help="agent 开发的 git 仓库路径（Rule A/C）")
@@ -433,6 +554,11 @@ def main() -> None:
     )
     submit_parser.add_argument("--no-close", action="store_true", help="通过时不自动关单")
 
+    ledger_parser = sub.add_parser("ledger", help="成本账本：汇总 qa_reviews/ledger.jsonl（次数/等待时长/打回率）")
+    harden_parser = sub.add_parser("agent-harden", help="把追加段安全固化进 agent instructions（整表替换纪律一键化）")
+    harden_parser.add_argument("agent", help="agent 名字或 id")
+    harden_parser.add_argument("addition_file", help="追加段文件（UTF-8，须含 marker）")
+    harden_parser.add_argument("--marker", required=True, help="幂等标记（追加段中的唯一串，重复追加时据此跳过）")
     auto_parser = sub.add_parser("auto", help="引擎全自动验收：抓取 → LLM 评审 → 回写 → 关单（需 LLM key，适合批量）")
     auto_parser.add_argument("issue_ids", nargs="+", help="Multica issue 的 ID/identifier")
 
